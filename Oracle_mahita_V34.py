@@ -603,6 +603,47 @@ with tabs[2]:
 #  TAB 3 — RÉSULTATS  (OCR reécrit pour le format de l'app)
 # ════════════════════════════════════════════════════════════
 
+def preprocess_image_for_ocr(image_bytes):
+    """
+    Retourne plusieurs versions de l'image pour maximiser la détection OCR.
+    Stratégie multi-passes : original + contraste élevé + inversé + niveaux de gris boosté.
+    """
+    from PIL import Image as PILImage, ImageEnhance, ImageFilter, ImageOps
+    import io as _io
+    import numpy as np
+
+    results = []
+    img_orig = PILImage.open(_io.BytesIO(image_bytes)).convert("RGB")
+
+    # Version 1 : originale (bytes)
+    results.append(image_bytes)
+
+    # Version 2 : contraste x2.5 + netteté (pour texte blanc sur fond gris foncé)
+    img2 = ImageEnhance.Contrast(img_orig).enhance(2.5)
+    img2 = ImageEnhance.Sharpness(img2).enhance(2.0)
+    buf2 = _io.BytesIO(); img2.save(buf2, format='JPEG', quality=95)
+    results.append(buf2.getvalue())
+
+    # Version 3 : niveaux de gris + seuillage adaptatif (binarisation)
+    img3 = img_orig.convert("L")
+    arr  = np.array(img3)
+    # Seuil Otsu simplifié
+    threshold = int(arr.mean())
+    arr_bin = np.where(arr > threshold, 255, 0).astype(np.uint8)
+    img3b = PILImage.fromarray(arr_bin)
+    buf3 = _io.BytesIO(); img3b.save(buf3, format='JPEG', quality=95)
+    results.append(buf3.getvalue())
+
+    # Version 4 : image agrandie x1.5 (aide EasyOCR sur les petits textes)
+    W, H = img_orig.size
+    img4 = img_orig.resize((int(W*1.5), int(H*1.5)), PILImage.LANCZOS)
+    img4 = ImageEnhance.Contrast(img4).enhance(2.0)
+    buf4 = _io.BytesIO(); img4.save(buf4, format='JPEG', quality=95)
+    results.append(buf4.getvalue())
+
+    return results
+
+
 def ocr_resultats(image_bytes, teams_list):
     """
     OCR spécialisé pour le format exact de l'application :
@@ -610,38 +651,75 @@ def ocr_resultats(image_bytes, teams_list):
       [Logo]  Équipe DOM      [Score]     Équipe EXT  [Logo]
                 mm' mm'       MT: x:x       mm' mm'
 
-    Stratégie robuste :
-      1. Lire tous les blocs OCR avec positions x,y
-      2. Trier par Y → regrouper en lignes (tolérance 30px)
-      3. Pour chaque bloc : classifier en ÉQUIPE / SCORE / MT / MINUTES
-      4. Construire les matchs en associant équipes+score sur la même bande Y
-         puis rattacher le MT de la ligne suivante
+    Stratégie multi-passes :
+      - Passe 1 : image originale
+      - Passe 2 : image avec contraste boosté
+      - Passe 3 : image binarisée
+      - Passe 4 : image agrandie
+      Fusion de tous les blocs détectés → meilleure couverture.
     """
-    raw = reader.readtext(image_bytes, detail=1)
-    if not raw:
-        return []
-
     from PIL import Image as PILImage
     import io as _io
-    img = PILImage.open(_io.BytesIO(image_bytes))
-    W, H = img.size
-    mid_x = W * 0.45   # centre approximatif (légèrement décalé car score au centre)
 
-    # ── 1. Enrichir chaque bloc avec cy, cx ──────────────────
+    # ── Multi-passes OCR ─────────────────────────────────────
+    all_raw = []
+    versions = preprocess_image_for_ocr(image_bytes)
+
+    for i, img_bytes in enumerate(versions):
+        try:
+            raw = reader.readtext(img_bytes, detail=1,
+                                  paragraph=False,
+                                  contrast_ths=0.1,
+                                  adjust_contrast=0.5)
+            # Pour la version agrandie (i==3), normaliser les coordonnées /1.5
+            if i == 3:
+                raw_norm = []
+                for (bbox, text, prob) in raw:
+                    bbox_n = [[p[0]/1.5, p[1]/1.5] for p in bbox]
+                    raw_norm.append((bbox_n, text, prob))
+                all_raw.extend(raw_norm)
+            else:
+                all_raw.extend(raw)
+        except Exception:
+            continue
+
+    if not all_raw:
+        return []
+
+    # ── Dimensions image originale ────────────────────────────
+    img_orig = PILImage.open(_io.BytesIO(image_bytes))
+    W, H = img_orig.size
+    mid_x = W * 0.48
+
+    # ── 1. Enrichir chaque bloc détecté ──────────────────────
     blocs = []
-    for (bbox, text, prob) in raw:
-        cx = (bbox[0][0] + bbox[1][0]) / 2
-        cy = (bbox[0][1] + bbox[2][1]) / 2
-        w  = abs(bbox[1][0] - bbox[0][0])
-        blocs.append({'text': text.strip(), 'cx': cx, 'cy': cy, 'w': w, 'prob': prob})
+    seen_texts = set()
+    for item in all_raw:
+        bbox, text, prob = item[0], item[1], item[2]
+        text = text.strip()
+        if not text or prob < 0.15:
+            continue
+        try:
+            cx = (bbox[0][0] + bbox[1][0]) / 2
+            cy = (bbox[0][1] + bbox[2][1]) / 2
+        except Exception:
+            continue
 
-    # ── 2. Regrouper en lignes horizontales (tolérance 30px) ─
+        # Dédupliquer : même texte à ±20px = doublon
+        key = f"{text.lower()}_{int(cx/20)}_{int(cy/20)}"
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+
+        blocs.append({'text': text, 'cx': cx, 'cy': cy, 'prob': prob})
+
+    # ── 2. Regrouper en lignes horizontales (tolérance 28px) ─
     blocs_sorted = sorted(blocs, key=lambda b: b['cy'])
     lines = []
     for b in blocs_sorted:
         placed = False
         for ln in lines:
-            if abs(b['cy'] - ln['cy_mean']) < 30:
+            if abs(b['cy'] - ln['cy_mean']) < 28:
                 ln['blocs'].append(b)
                 ln['cy_mean'] = sum(x['cy'] for x in ln['blocs']) / len(ln['blocs'])
                 placed = True
@@ -651,37 +729,51 @@ def ocr_resultats(image_bytes, teams_list):
 
     # ── 3. Classifier chaque ligne ───────────────────────────
     def classify_line(ln):
-        blocs_sorted_x = sorted(ln['blocs'], key=lambda b: b['cx'])
-        full = ' '.join(b['text'] for b in blocs_sorted_x)
+        bx = sorted(ln['blocs'], key=lambda b: b['cx'])
+        full = ' '.join(b['text'] for b in bx)
 
-        # Score final  ex: "1:0"  "2 : 2"  "0-4"
+        # Score final — patterns variés que EasyOCR peut produire
         score = None
-        for b in blocs_sorted_x:
-            t = b['text'].replace(' ', '')
+        for b in bx:
+            t = b['text'].replace(' ', '').replace('|', ':').replace('l', ':')
+            # Match standard ex: "2:1" "0:4" "1-0"
             m = re.match(r'^(\d{1,2})[:\-](\d{1,2})$', t)
-            if m:
-                # Vérifier que c'est pas un score MT déjà intégré dans le texte
-                if 'MT' not in full.upper():
-                    score = {'val': f"{m.group(1)}:{m.group(2)}", 'cx': b['cx']}
+            if not m:
+                # EasyOCR confond parfois ":" avec "." ou ","
+                m = re.match(r'^(\d{1,2})[.,](\d{1,2})$', t)
+            if m and 'MT' not in full.upper():
+                sh, sa = int(m.group(1)), int(m.group(2))
+                # Filtre : scores de foot réalistes (0-9 chacun)
+                if 0 <= sh <= 9 and 0 <= sa <= 9:
+                    score = {'val': f"{sh}:{sa}", 'cx': b['cx']}
                     break
 
-        # Score MT  ex: "MT: 1:0"  "MT:1:1"  "MT 0:0"
+        # Recherche score dans le texte complet si non trouvé en bloc isolé
+        if not score and 'MT' not in full.upper():
+            m2 = re.search(r'\b(\d)[:\-\.](\d)\b', full)
+            if m2:
+                # Localiser cx approximatif (milieu de la ligne)
+                mid_ln = sum(b['cx'] for b in bx) / len(bx) if bx else mid_x
+                score = {'val': f"{m2.group(1)}:{m2.group(2)}", 'cx': mid_ln}
+
+        # Score MT
         mt = None
         mt_m = re.search(r'MT\s*[:\-]?\s*(\d{1,2})\s*[:\-]\s*(\d{1,2})', full, re.IGNORECASE)
+        if not mt_m:
+            mt_m = re.search(r'MT\s*[:\-]?\s*(\d)[.,](\d)', full, re.IGNORECASE)
         if mt_m:
             mt = f"{mt_m.group(1)}:{mt_m.group(2)}"
 
-        # Équipes dans cette ligne
+        # Équipes
         teams = []
-        for b in blocs_sorted_x:
+        for b in bx:
             t = engine.clean_team(b['text'])
             if t:
                 teams.append({'name': t, 'cx': b['cx']})
 
-        # Minutes de buts  ex: "24'" "82'" "19'"
-        mins_left  = []
-        mins_right = []
-        for b in blocs_sorted_x:
+        # Minutes de buts
+        mins_left, mins_right = [], []
+        for b in bx:
             mins = re.findall(r"(\d{1,3})'", b['text'])
             if mins:
                 if b['cx'] < mid_x:
@@ -690,12 +782,9 @@ def ocr_resultats(image_bytes, teams_list):
                     mins_right += [f"{x}'" for x in mins]
 
         return {
-            'full': full,
-            'score': score,
-            'mt': mt,
+            'full': full, 'score': score, 'mt': mt,
             'teams': teams,
-            'mins_left': mins_left,
-            'mins_right': mins_right,
+            'mins_left': mins_left, 'mins_right': mins_right,
             'cy': ln['cy_mean']
         }
 
@@ -707,59 +796,67 @@ def ocr_resultats(image_bytes, teams_list):
 
     for cl in classified:
 
-        # Ligne avec SCORE → nouveau match
+        # Ligne avec SCORE → nouveau match potentiel
         if cl['score'] and not cl['mt']:
             sx = cl['score']['cx']
+            dom_teams = [t for t in cl['teams'] if t['cx'] < sx - W*0.05]
+            ext_teams = [t for t in cl['teams'] if t['cx'] > sx + W*0.05]
 
-            # Équipes : gauche du score = DOM, droite = EXT
-            dom_teams = [t for t in cl['teams'] if t['cx'] < sx]
-            ext_teams = [t for t in cl['teams'] if t['cx'] >= sx]
-
-            # Si les équipes ne sont pas sur la même ligne que le score
-            # (peut arriver) → on accepte quand même le score et on attend
             dom = dom_teams[0]['name'] if dom_teams else None
             ext = ext_teams[0]['name'] if ext_teams else None
 
-            current = {
-                'h':  dom or '?',
-                'a':  ext or '?',
-                's':  cl['score']['val'],
-                'mt': '',
-                'hm': ' '.join(cl['mins_left']),
-                'am': ' '.join(cl['mins_right'])
-            }
-            matches.append(current)
+            # Si les équipes sont sur une ligne précédente sans score,
+            # on peut avoir déjà un current avec score=None → compléter
+            if current and current['s'] == '__PENDING__' and (dom or ext):
+                if dom: current['h'] = dom
+                if ext: current['a'] = ext
+                current['s'] = cl['score']['val']
+                current['hm'] = ' '.join(cl['mins_left'])
+                current['am'] = ' '.join(cl['mins_right'])
+            else:
+                current = {
+                    'h':  dom or '?',
+                    'a':  ext or '?',
+                    's':  cl['score']['val'],
+                    'mt': '',
+                    'hm': ' '.join(cl['mins_left']),
+                    'am': ' '.join(cl['mins_right'])
+                }
+                matches.append(current)
 
-        # Ligne avec MT → rattacher au match courant
-        elif cl['mt'] and current is not None:
+        # Ligne MT → rattacher
+        elif cl['mt'] and current is not None and current['s'] != '__PENDING__':
             current['mt'] = cl['mt']
-            # Enrichir les minutes si présentes sur la ligne MT
             if cl['mins_left']:
-                current['hm'] += ' ' + ' '.join(cl['mins_left'])
+                current['hm'] = (current['hm'] + ' ' + ' '.join(cl['mins_left'])).strip()
             if cl['mins_right']:
-                current['am'] += ' ' + ' '.join(cl['mins_right'])
+                current['am'] = (current['am'] + ' ' + ' '.join(cl['mins_right'])).strip()
 
-        # Ligne avec équipes SANS score → peut compléter un match incomplet
+        # Ligne équipes sans score → peut précéder le score (rare) ou compléter
         elif cl['teams'] and not cl['score'] and not cl['mt']:
             if current is not None:
-                # Compléter équipe manquante
                 if current['h'] == '?':
                     left = [t for t in cl['teams'] if t['cx'] < mid_x]
-                    if left:
-                        current['h'] = left[0]['name']
+                    if left: current['h'] = left[0]['name']
                 if current['a'] == '?':
                     right = [t for t in cl['teams'] if t['cx'] >= mid_x]
-                    if right:
-                        current['a'] = right[0]['name']
-            # Ajouter les minutes sur les lignes de buteurs
+                    if right: current['a'] = right[0]['name']
             if current is not None:
                 if cl['mins_left']:
-                    current['hm'] += ' ' + ' '.join(cl['mins_left'])
+                    current['hm'] = (current['hm'] + ' ' + ' '.join(cl['mins_left'])).strip()
                 if cl['mins_right']:
-                    current['am'] += ' ' + ' '.join(cl['mins_right'])
+                    current['am'] = (current['am'] + ' ' + ' '.join(cl['mins_right'])).strip()
 
-    # Nettoyer les '?' résiduels avec les noms du calendrier si dispo
-    return [m for m in matches if m['h'] != '?' or m['a'] != '?'][:10]
+    # ── 5. Post-traitement : compléter depuis le calendrier ──
+    # Les matchs avec '?' → on essaie de les compléter depuis l'historique
+    valid = []
+    for m in matches:
+        if m.get('s') and m['s'] != '__PENDING__' and m['s'] != '0:0':
+            valid.append(m)
+        elif m.get('s') == '0:0' and (m['h'] != '?' or m['a'] != '?'):
+            valid.append(m)  # garder même si score non lu (l'utilisateur corrige)
+
+    return valid[:10]
 
 
 with tabs[3]:
@@ -769,24 +866,48 @@ with tabs[3]:
 
     extracted_matches = []
 
+    # Calendrier de référence pour compléter l'OCR
+    jk_res_key = f"Journée {j_res}"
+    cal_ref = st.session_state['history'][s_active].get(jk_res_key, {}).get("cal", [])
+
     if f_res:
-        with st.spinner("🔍 Lecture OCR des résultats..."):
+        with st.spinner("🔍 Lecture OCR multi-passes en cours... (peut prendre 20-30 sec)"):
             image_bytes = f_res.getvalue()
             extracted_matches = ocr_resultats(image_bytes, engine.teams_list)
 
-        if extracted_matches:
-            custom_notify(f"✅ OCR terminé — {len(extracted_matches)} matchs détectés", color="#7FFFD4")
-        else:
-            st.warning("⚠️ L'OCR n'a rien détecté. Vérifiez la qualité de l'image ou saisissez manuellement.")
+        # ── Fusion OCR + Calendrier ──────────────────────────
+        # Si l'OCR a trouvé moins de matchs que le calendrier,
+        # on complète avec les équipes du calendrier (score à corriger manuellement)
+        if cal_ref and len(extracted_matches) < len(cal_ref):
+            ocr_pairs = set()
+            for m in extracted_matches:
+                ocr_pairs.add(m['h']); ocr_pairs.add(m['a'])
 
-    # Saisie manuelle depuis le calendrier si pas d'image
-    if not extracted_matches:
-        jk_res_key = f"Journée {j_res}"
-        cal_data = st.session_state['history'][s_active].get(jk_res_key, {}).get("cal", [])
-        for m in cal_data:
-            extracted_matches.append({"h": m["h"], "a": m["a"], "s": "0:0", "hm": "", "am": "", "mt": ""})
-        if cal_data:
-            st.info("📋 Calendrier chargé — remplissez les scores manuellement ou importez une image.")
+            for cal_m in cal_ref:
+                # Match absent de l'OCR → ajouter avec score vide
+                if cal_m['h'] not in ocr_pairs and cal_m['a'] not in ocr_pairs:
+                    extracted_matches.append({
+                        "h": cal_m["h"], "a": cal_m["a"],
+                        "s": "", "hm": "", "am": "", "mt": ""
+                    })
+
+        nb = len(extracted_matches)
+        if nb > 0:
+            scores_lus = sum(1 for m in extracted_matches if m.get('s') and m['s'] not in ('', '0:0'))
+            custom_notify(
+                f"✅ OCR terminé — {nb} matchs · {scores_lus} scores lus automatiquement",
+                color="#7FFFD4"
+            )
+            if scores_lus < nb:
+                st.info(f"ℹ️ {nb - scores_lus} score(s) non lus — vérifiez et complétez manuellement.")
+        else:
+            st.warning("⚠️ OCR sans résultat. Chargement depuis le calendrier.")
+
+    # Fallback : calendrier seul (sans image)
+    if not extracted_matches and cal_ref:
+        for m in cal_ref:
+            extracted_matches.append({"h": m["h"], "a": m["a"], "s": "", "hm": "", "am": "", "mt": ""})
+        st.info("📋 Calendrier chargé — saisissez les scores manuellement.")
 
     with st.form("res_val_form"):
         final_res_data = []
