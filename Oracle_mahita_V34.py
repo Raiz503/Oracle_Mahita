@@ -263,21 +263,18 @@ with tabs[0]:
         st.session_state['history'][s_active], engine.teams_list
     )
 
-    # Colorisation du classement
-    def style_classement(df):
-        styles = []
-        for i, row in df.iterrows():
-            rang = row['Rang']
-            if rang <= 3:
-                styles.append(['background-color: rgba(0,255,0,0.1)'] * len(row))
-            elif rang >= 17:
-                styles.append(['background-color: rgba(255,75,75,0.1)'] * len(row))
-            else:
-                styles.append([''] * len(row))
-        return styles
+    # Colorisation du classement — compatible Pandas Styler
+    def style_classement(row):
+        rang = row['Rang']
+        if rang <= 3:
+            return ['background-color: rgba(0,255,0,0.1)'] * len(row)
+        elif rang >= 17:
+            return ['background-color: rgba(255,75,75,0.1)'] * len(row)
+        else:
+            return [''] * len(row)
 
     st.dataframe(
-        current_standings.style.apply(style_classement, axis=None),
+        current_standings.style.apply(style_classement, axis=1),
         use_container_width=True,
         hide_index=True
     )
