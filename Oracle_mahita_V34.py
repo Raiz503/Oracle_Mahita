@@ -550,83 +550,259 @@ with tabs[2]:
         show_ticket(c2, "TICKET RISQUE", "prono-risque", risque_d, "🟡")
         show_ticket(c3, "TICKET FUN",    "prono-fun",    fun_d,    "🔴")
 
+        # ── SCORES EXACTS PROBABLES ──────────────────────────
+        st.divider()
+        st.markdown("## 🎯 Scores Exacts Probables")
+        st.caption("Top 3 scores les plus probables pour chaque match (modèle Poisson)")
+
+        import math
+
+        def poisson_prob(lam, k):
+            try:
+                return (lam**k * math.exp(-lam)) / math.factorial(k)
+            except:
+                return 0.0
+
+        scores_data = []
+        for m in st.session_state['current_ready']:
+            c1v, cxv, c2v = float(m['o'][0]), float(m['o'][1]), float(m['o'][2])
+            # Lambda Poisson approximé depuis les cotes
+            lam_h = max(0.3, round(2.5 / c1v + 0.3, 2))
+            lam_a = max(0.3, round(2.5 / c2v + 0.1, 2))
+
+            score_probs = {}
+            for sh in range(0, 6):
+                for sa in range(0, 6):
+                    prob = poisson_prob(lam_h, sh) * poisson_prob(lam_a, sa)
+                    score_probs[f"{sh}:{sa}"] = round(prob * 100, 1)
+
+            top3 = sorted(score_probs.items(), key=lambda x: x[1], reverse=True)[:3]
+            scores_data.append({
+                'match': f"{m['h']} vs {m['a']}",
+                'scores': top3
+            })
+
+        for i in range(0, len(scores_data), 2):
+            col_a, col_b = st.columns(2)
+            for col, idx in [(col_a, i), (col_b, i+1)]:
+                if idx < len(scores_data):
+                    sd = scores_data[idx]
+                    colors = ["#00FF00", "#FFA500", "#FF4B4B"]
+                    badges = ""
+                    for j, (sc, pr) in enumerate(sd['scores']):
+                        badges += f'<span style="color:{colors[j]};font-weight:900;font-size:1.05em;">{sc}</span> <span style="color:#aaa;font-size:0.8em;">({pr}%)</span> &nbsp; '
+                    with col:
+                        st.markdown(
+                            f'<div style="border:1px solid #7FFFD4;border-radius:8px;padding:10px;margin:4px 0;background:rgba(127,255,212,0.05);">'
+                            f'<b>⚽ {sd["match"]}</b><br>{badges}</div>',
+                            unsafe_allow_html=True
+                        )
+
 
 # ════════════════════════════════════════════════════════════
-#  TAB 3 — RÉSULTATS
+#  TAB 3 — RÉSULTATS  (OCR reécrit pour le format de l'app)
 # ════════════════════════════════════════════════════════════
+
+def ocr_resultats(image_bytes, teams_list):
+    """
+    OCR spécialisé pour le format exact de l'application :
+
+      [Logo]  Équipe DOM      [Score]     Équipe EXT  [Logo]
+                mm' mm'       MT: x:x       mm' mm'
+
+    Stratégie robuste :
+      1. Lire tous les blocs OCR avec positions x,y
+      2. Trier par Y → regrouper en lignes (tolérance 30px)
+      3. Pour chaque bloc : classifier en ÉQUIPE / SCORE / MT / MINUTES
+      4. Construire les matchs en associant équipes+score sur la même bande Y
+         puis rattacher le MT de la ligne suivante
+    """
+    raw = reader.readtext(image_bytes, detail=1)
+    if not raw:
+        return []
+
+    from PIL import Image as PILImage
+    import io as _io
+    img = PILImage.open(_io.BytesIO(image_bytes))
+    W, H = img.size
+    mid_x = W * 0.45   # centre approximatif (légèrement décalé car score au centre)
+
+    # ── 1. Enrichir chaque bloc avec cy, cx ──────────────────
+    blocs = []
+    for (bbox, text, prob) in raw:
+        cx = (bbox[0][0] + bbox[1][0]) / 2
+        cy = (bbox[0][1] + bbox[2][1]) / 2
+        w  = abs(bbox[1][0] - bbox[0][0])
+        blocs.append({'text': text.strip(), 'cx': cx, 'cy': cy, 'w': w, 'prob': prob})
+
+    # ── 2. Regrouper en lignes horizontales (tolérance 30px) ─
+    blocs_sorted = sorted(blocs, key=lambda b: b['cy'])
+    lines = []
+    for b in blocs_sorted:
+        placed = False
+        for ln in lines:
+            if abs(b['cy'] - ln['cy_mean']) < 30:
+                ln['blocs'].append(b)
+                ln['cy_mean'] = sum(x['cy'] for x in ln['blocs']) / len(ln['blocs'])
+                placed = True
+                break
+        if not placed:
+            lines.append({'cy_mean': b['cy'], 'blocs': [b]})
+
+    # ── 3. Classifier chaque ligne ───────────────────────────
+    def classify_line(ln):
+        blocs_sorted_x = sorted(ln['blocs'], key=lambda b: b['cx'])
+        full = ' '.join(b['text'] for b in blocs_sorted_x)
+
+        # Score final  ex: "1:0"  "2 : 2"  "0-4"
+        score = None
+        for b in blocs_sorted_x:
+            t = b['text'].replace(' ', '')
+            m = re.match(r'^(\d{1,2})[:\-](\d{1,2})$', t)
+            if m:
+                # Vérifier que c'est pas un score MT déjà intégré dans le texte
+                if 'MT' not in full.upper():
+                    score = {'val': f"{m.group(1)}:{m.group(2)}", 'cx': b['cx']}
+                    break
+
+        # Score MT  ex: "MT: 1:0"  "MT:1:1"  "MT 0:0"
+        mt = None
+        mt_m = re.search(r'MT\s*[:\-]?\s*(\d{1,2})\s*[:\-]\s*(\d{1,2})', full, re.IGNORECASE)
+        if mt_m:
+            mt = f"{mt_m.group(1)}:{mt_m.group(2)}"
+
+        # Équipes dans cette ligne
+        teams = []
+        for b in blocs_sorted_x:
+            t = engine.clean_team(b['text'])
+            if t:
+                teams.append({'name': t, 'cx': b['cx']})
+
+        # Minutes de buts  ex: "24'" "82'" "19'"
+        mins_left  = []
+        mins_right = []
+        for b in blocs_sorted_x:
+            mins = re.findall(r"(\d{1,3})'", b['text'])
+            if mins:
+                if b['cx'] < mid_x:
+                    mins_left  += [f"{x}'" for x in mins]
+                else:
+                    mins_right += [f"{x}'" for x in mins]
+
+        return {
+            'full': full,
+            'score': score,
+            'mt': mt,
+            'teams': teams,
+            'mins_left': mins_left,
+            'mins_right': mins_right,
+            'cy': ln['cy_mean']
+        }
+
+    classified = [classify_line(ln) for ln in lines]
+
+    # ── 4. Construire les matchs ──────────────────────────────
+    matches = []
+    current = None
+
+    for cl in classified:
+
+        # Ligne avec SCORE → nouveau match
+        if cl['score'] and not cl['mt']:
+            sx = cl['score']['cx']
+
+            # Équipes : gauche du score = DOM, droite = EXT
+            dom_teams = [t for t in cl['teams'] if t['cx'] < sx]
+            ext_teams = [t for t in cl['teams'] if t['cx'] >= sx]
+
+            # Si les équipes ne sont pas sur la même ligne que le score
+            # (peut arriver) → on accepte quand même le score et on attend
+            dom = dom_teams[0]['name'] if dom_teams else None
+            ext = ext_teams[0]['name'] if ext_teams else None
+
+            current = {
+                'h':  dom or '?',
+                'a':  ext or '?',
+                's':  cl['score']['val'],
+                'mt': '',
+                'hm': ' '.join(cl['mins_left']),
+                'am': ' '.join(cl['mins_right'])
+            }
+            matches.append(current)
+
+        # Ligne avec MT → rattacher au match courant
+        elif cl['mt'] and current is not None:
+            current['mt'] = cl['mt']
+            # Enrichir les minutes si présentes sur la ligne MT
+            if cl['mins_left']:
+                current['hm'] += ' ' + ' '.join(cl['mins_left'])
+            if cl['mins_right']:
+                current['am'] += ' ' + ' '.join(cl['mins_right'])
+
+        # Ligne avec équipes SANS score → peut compléter un match incomplet
+        elif cl['teams'] and not cl['score'] and not cl['mt']:
+            if current is not None:
+                # Compléter équipe manquante
+                if current['h'] == '?':
+                    left = [t for t in cl['teams'] if t['cx'] < mid_x]
+                    if left:
+                        current['h'] = left[0]['name']
+                if current['a'] == '?':
+                    right = [t for t in cl['teams'] if t['cx'] >= mid_x]
+                    if right:
+                        current['a'] = right[0]['name']
+            # Ajouter les minutes sur les lignes de buteurs
+            if current is not None:
+                if cl['mins_left']:
+                    current['hm'] += ' ' + ' '.join(cl['mins_left'])
+                if cl['mins_right']:
+                    current['am'] += ' ' + ' '.join(cl['mins_right'])
+
+    # Nettoyer les '?' résiduels avec les noms du calendrier si dispo
+    return [m for m in matches if m['h'] != '?' or m['a'] != '?'][:10]
+
 
 with tabs[3]:
     st.markdown("### ⚽ Saisie des Résultats")
     j_res = st.number_input("Journée Résultat", 1, 50, 1, key="jres")
-    f_res = st.file_uploader("📸 Scan Résultats (optionnel)", type=['jpg','png','jpeg'])
+    f_res = st.file_uploader("📸 Scan Résultats", type=['jpg','png','jpeg'], key="up_res")
 
     extracted_matches = []
 
     if f_res:
         with st.spinner("🔍 Lecture OCR des résultats..."):
-            img = Image.open(f_res)
-            w, hi = img.size
-            mid = w / 2
-            raw = reader.readtext(f_res.getvalue(), detail=1)
-            raw.sort(key=lambda x: x[0][0][1])
+            image_bytes = f_res.getvalue()
+            extracted_matches = ocr_resultats(image_bytes, engine.teams_list)
 
-        tms = [
-            t for t in [
-                {"n": engine.clean_team(txt), "y": b[0][1], "x": (b[0][0]+b[1][0])/2}
-                for (b, txt, p) in raw
-            ]
-            if t["n"] and hi*0.12 < t["y"] < hi*0.95
-        ]
-        ancs = []
-        for t in tms:
-            if t["x"] < mid and (not ancs or abs(t["y"] - ancs[-1]["y"]) > 45):
-                ancs.append(t)
+        if extracted_matches:
+            custom_notify(f"✅ OCR terminé — {len(extracted_matches)} matchs détectés", color="#7FFFD4")
+        else:
+            st.warning("⚠️ L'OCR n'a rien détecté. Vérifiez la qualité de l'image ou saisissez manuellement.")
 
-        for i, a in enumerate(ancs):
-            if len(extracted_matches) >= 10:
-                break
-            ys = a["y"] - 15
-            ye = (ancs[i+1]["y"] - 15 if i+1 < len(ancs) else hi * 0.98)
-            inf = {"h": a["n"], "a": "Inconnu", "s": "0:0", "hm": "", "am": "", "mt": ""}
-            for (bb, tx, p) in raw:
-                cy = (bb[0][1]+bb[2][1])/2
-                cx = (bb[0][0]+bb[1][0])/2
-                if ys <= cy <= ye:
-                    tn = engine.clean_team(tx)
-                    if tn and cx > mid and tn != inf["h"]:
-                        inf["a"] = tn
-                    elif re.search(r"^\d[:\-]\d$", tx.strip()) and "MT" not in tx.upper():
-                        inf["s"] = tx
-                    elif "MT" in tx.upper():
-                        inf["mt"] = tx
-                    elif re.search(r"\d+", tx) and not re.search(r"^\d[:\-]\d$", tx):
-                        if cx < mid:
-                            inf["hm"] += f" {tx}'"
-                        else:
-                            inf["am"] += f" {tx}'"
-            if inf["a"] != "Inconnu":
-                extracted_matches.append(inf)
-
-    else:
-        # Saisie manuelle depuis le calendrier enregistré
-        jk_res = f"Journée {j_res}"
-        cal_data = st.session_state['history'][s_active].get(jk_res, {}).get("cal", [])
+    # Saisie manuelle depuis le calendrier si pas d'image
+    if not extracted_matches:
+        jk_res_key = f"Journée {j_res}"
+        cal_data = st.session_state['history'][s_active].get(jk_res_key, {}).get("cal", [])
         for m in cal_data:
             extracted_matches.append({"h": m["h"], "a": m["a"], "s": "0:0", "hm": "", "am": "", "mt": ""})
+        if cal_data:
+            st.info("📋 Calendrier chargé — remplissez les scores manuellement ou importez une image.")
 
     with st.form("res_val_form"):
         final_res_data = []
         if not extracted_matches:
             st.info("📋 Importez une image ou vérifiez que le calendrier de cette journée est enregistré.")
         for i, r in enumerate(extracted_matches):
-            st.markdown(f"**{r['h']} vs {r['a']}**")
+            col_title, _ = st.columns([4, 1])
+            col_title.markdown(f"**Match {i+1} — {r['h']} vs {r['a']}**")
             c1, c2 = st.columns(2)
-            fs = c1.text_input("Score Final (ex: 2:1)", r['s'], key=f"rs{i}")
-            ms = c2.text_input("Score MT (ex: 1:0)", r.get('mt',''), key=f"rm{i}")
+            fs = c1.text_input("Score Final (ex: 2:1)", r.get('s','0:0'), key=f"rs{i}")
+            ms = c2.text_input("Score Mi-Temps",        r.get('mt',''),   key=f"rm{i}")
             b1, b2 = st.columns(2)
-            bh = b1.text_input("Buteurs Domicile", r.get('hm',''), key=f"rbh{i}")
-            ba = b2.text_input("Buteurs Extérieur", r.get('am',''), key=f"rba{i}")
+            bh = b1.text_input(f"Buteurs {r['h']}", r.get('hm',''), key=f"rbh{i}")
+            ba = b2.text_input(f"Buteurs {r['a']}", r.get('am',''), key=f"rba{i}")
             final_res_data.append({"h": r['h'], "a": r['a'], "s": fs, "mt": ms, "hm": bh, "am": ba})
+            st.divider()
 
         if st.form_submit_button("✅ ENREGISTRER LES RÉSULTATS"):
             sn = st.session_state['s_active']
@@ -651,32 +827,53 @@ with tabs[4]:
     for jk in sorted_j:
         with st.expander(f"📅 {jk}"):
             d = st.session_state['history'][s_active][jk]
-            h_tabs = st.tabs(["📋 Calendrier", "🎯 Prono", "⚽ Résultat"])
 
-            with h_tabs[0]:
-                if d.get("cal"):
-                    st.table(pd.DataFrame(d["cal"]))
-                    if st.button(f"🔮 Relancer les Pronos", key=f"sim_{jk}"):
-                        st.session_state['current_ready'] = d["cal"]
-                        st.session_state['current_j_num'] = int(re.search(r'\d+', jk).group())
+            # Bouton supprimer + confirmation
+            col_hdr, col_del_btn = st.columns([5, 1])
+            with col_del_btn:
+                if st.button("🗑️ Supprimer", key=f"del_{jk}", help=f"Supprimer {jk}"):
+                    st.session_state[f'confirm_del_{jk}'] = True
+
+            if st.session_state.get(f'confirm_del_{jk}', False):
+                st.warning(f"⚠️ Confirmer la suppression de **{jk}** ? Action irréversible.")
+                cy, cn = st.columns(2)
+                with cy:
+                    if st.button("✅ Oui, supprimer", key=f"yes_{jk}", type="primary"):
+                        del st.session_state['history'][s_active][jk]
+                        st.session_state.pop(f'confirm_del_{jk}', None)
+                        save_db(st.session_state['history'])
                         st.rerun()
-                else:
-                    st.write("Aucun calendrier enregistré.")
+                with cn:
+                    if st.button("❌ Annuler", key=f"no_{jk}"):
+                        st.session_state.pop(f'confirm_del_{jk}', None)
+                        st.rerun()
+            else:
+                h_tabs = st.tabs(["📋 Calendrier", "🎯 Prono", "⚽ Résultat"])
 
-            with h_tabs[1]:
-                pronos = d.get("pro", [])
-                if pronos:
-                    df_pro = pd.DataFrame(pronos)
-                    st.table(df_pro)
-                else:
-                    st.write("Aucun prono enregistré.")
+                with h_tabs[0]:
+                    if d.get("cal"):
+                        st.table(pd.DataFrame(d["cal"]))
+                        if st.button(f"🔮 Relancer les Pronos", key=f"sim_{jk}"):
+                            st.session_state['current_ready'] = d["cal"]
+                            st.session_state['current_j_num'] = int(re.search(r'\d+', jk).group())
+                            st.rerun()
+                    else:
+                        st.write("Aucun calendrier enregistré.")
 
-            with h_tabs[2]:
-                res = d.get("res", [])
-                if res:
-                    st.table(pd.DataFrame(res))
-                else:
-                    st.write("Aucun résultat enregistré.")
+                with h_tabs[1]:
+                    pronos = d.get("pro", [])
+                    if pronos:
+                        df_pro = pd.DataFrame(pronos)
+                        st.table(df_pro)
+                    else:
+                        st.write("Aucun prono enregistré.")
+
+                with h_tabs[2]:
+                    res = d.get("res", [])
+                    if res:
+                        st.table(pd.DataFrame(res))
+                    else:
+                        st.write("Aucun résultat enregistré.")
 
 
 # ════════════════════════════════════════════════════════════
